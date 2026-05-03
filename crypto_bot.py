@@ -7,7 +7,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    print("ERRORE: Variabili TELEGRAM_TOKEN e TELEGRAM_CHAT_ID non trovate!")
+    print("ERRORE: Variabili mancanti!")
     exit(1)
 
 MIN_LIQUIDITA_USD = 5000
@@ -47,43 +47,66 @@ def analizza_sicurezza_eth(address):
     return max(0, min(100, score)), problemi
 
 def analizza_sicurezza_sol(address):
-    score = 100
-    problemi = []
+    score = 50
+    problemi = ["Analisi base Solana"]
     try:
         r = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{address}/report/summary", timeout=10)
         if r.status_code == 200:
             rischio = r.json().get("score", 0)
             if rischio > 8000:
                 score = 10
-                problemi.append("ALTO RISCHIO RugCheck")
+                problemi = ["ALTO RISCHIO RugCheck"]
             elif rischio > 5000:
                 score = 40
-                problemi.append("Rischio medio RugCheck")
+                problemi = ["Rischio medio RugCheck"]
             else:
                 score = 90
-                problemi.append("Rischio basso RugCheck")
-        else:
-            score = 50
-            problemi.append("RugCheck non disponibile")
+                problemi = ["Rischio basso RugCheck"]
     except:
-        score = 50
-        problemi.append("Analisi Solana non disponibile")
+        pass
     return score, problemi
 
 token_visti = set()
 
 def fetch_token(chain_id):
     try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/recently-added?chainId={chain_id}"
+        url = f"https://api.dexscreener.com/token-profiles/latest/v1"
         r = requests.get(url, timeout=15)
-        return r.json().get("pairs", [])
+        if r.status_code != 200:
+            return []
+        dati = r.json()
+        if not isinstance(dati, list):
+            return []
+        return [d for d in dati if d.get("chainId") == chain_id]
     except Exception as e:
         print(f"Errore fetch {chain_id}: {e}")
         return []
 
-def analizza_token(pair, chain):
+def fetch_pair_info(token_address, chain_id):
     try:
-        address = pair.get("baseToken", {}).get("address", "")
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return None
+        dati = r.json()
+        pairs = dati.get("pairs")
+        if not pairs or len(pairs) == 0:
+            return None
+        return pairs[0]
+    except:
+        return None
+
+def analizza_token(token, chain):
+    try:
+        address = token.get("tokenAddress", "")
+        if not address or address in token_visti:
+            return False
+        token_visti.add(address)
+
+        pair = fetch_pair_info(address, chain.lower())
+        if not pair:
+            return False
+
         nome = pair.get("baseToken", {}).get("name", "Sconosciuto")
         simbolo = pair.get("baseToken", {}).get("symbol", "???")
         liquidita = float(pair.get("liquidity", {}).get("usd", 0) or 0)
@@ -92,10 +115,6 @@ def analizza_token(pair, chain):
         dex = pair.get("dexId", "Unknown")
         pair_address = pair.get("pairAddress", "")
         created_at = pair.get("pairCreatedAt", 0)
-
-        if address in token_visti:
-            return False
-        token_visti.add(address)
 
         eta_ore = (time.time() * 1000 - created_at) / (1000 * 3600) if created_at else 999
 
@@ -118,7 +137,7 @@ def analizza_token(pair, chain):
 
         emoji = "🟢" if score >= 80 else "🟡"
         chain_emoji = "🔷" if chain == "ETH" else "🟣"
-        problemi_testo = "\n".join(problemi) if problemi else "Nessun problema rilevato"
+        problemi_testo = "\n".join(problemi) if problemi else "Nessun problema"
 
         messaggio = f"""{chain_emoji} <b>NUOVO TOKEN {chain}</b>
 
@@ -129,18 +148,19 @@ def analizza_token(pair, chain):
 ⏱ Età: <b>{eta_ore:.1f} ore</b>
 🏦 DEX: <b>{dex}</b>
 
-{emoji} <b>Score Sicurezza: {score}/100</b>
+{emoji} <b>Score: {score}/100</b>
 {problemi_testo}
 
 📋 <code>{address}</code>
 🔗 <a href="{link_dex}">DexTools</a> | <a href="{link_scan}">Scan</a>
 
-⚠️ <i>DYOR - Fai sempre le tue ricerche!</i>"""
+⚠️ <i>DYOR!</i>"""
 
         invia_telegram(messaggio)
         return True
+
     except Exception as e:
-        print(f"Errore: {e}")
+        print(f"Errore analisi: {e}")
         return False
 
 def main():
@@ -150,11 +170,11 @@ def main():
     while True:
         ciclo += 1
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Ciclo #{ciclo}")
-        for pair in fetch_token("ethereum")[:20]:
-            analizza_token(pair, "ETH")
+        for token in fetch_token("ethereum")[:20]:
+            analizza_token(token, "ETH")
         time.sleep(3)
-        for pair in fetch_token("solana")[:20]:
-            analizza_token(pair, "SOL")
+        for token in fetch_token("solana")[:20]:
+            analizza_token(token, "SOL")
         print(f"Prossimo controllo tra {INTERVALLO_CONTROLLO}s...")
         time.sleep(INTERVALLO_CONTROLLO)
 
