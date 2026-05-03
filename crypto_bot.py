@@ -10,10 +10,10 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     print("ERRORE: Variabili mancanti!")
     exit(1)
 
-MIN_LIQUIDITA_USD = 5000
-MIN_VOLUME_24H_USD = 1000
-MAX_ETA_ORE = 48
-MIN_SICUREZZA_SCORE = 70
+MIN_LIQUIDITA_USD = 10000
+MIN_VOLUME_24H_USD = 5000
+MAX_ETA_ORE = 24
+MIN_SICUREZZA_SCORE = 80
 INTERVALLO_CONTROLLO = 60
 
 def invia_telegram(messaggio):
@@ -21,122 +21,151 @@ def invia_telegram(messaggio):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": messaggio, "parse_mode": "HTML"}
         requests.post(url, json=payload, timeout=10)
-        print("Alert Telegram inviato!")
+        print("Alert inviato!")
     except Exception as e:
         print(f"Errore Telegram: {e}")
 
-def check_blockaid(address, chain):
-    """Controlla Blockaid - il sistema usato da Uniswap/MetaMask"""
+def check_goplus_eth(address):
+    """GoPlus check per Ethereum - molto dettagliato"""
     try:
-        chain_id = "1" if chain == "ETH" else "900"
-        url = f"https://api.blockaid.io/v0/evm/token/scan"
-        headers = {"X-API-Key": "free"}
-        payload = {
-            "chain_id": chain_id,
-            "address": address
-        }
-        r = requests.post(url, json=payload, headers=headers, timeout=10)
-        if r.status_code == 200:
-            dati = r.json()
-            risultato = dati.get("result", {})
-            verdict = risultato.get("verdict", "")
-            if verdict in ["malicious", "spam"]:
-                return False, f"🚨 BLOCKAID: {verdict.upper()}"
-            return True, "✅ Blockaid OK"
-    except:
-        pass
-    return True, "⚠️ Blockaid non disponibile"
-
-def check_goplus(address, chain):
-    """Controlla GoPlus Security - database malicious tokens"""
-    try:
-        chain_id = "1" if chain == "ETH" else "900"
-        url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={address}"
+        url = f"https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses={address}"
         r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            dati = r.json()
-            risultato = dati.get("result", {}).get(address.lower(), {})
-            problemi = []
-            score_penalty = 0
+        if r.status_code != 200:
+            return 0, ["❌ GoPlus non raggiungibile"]
+        
+        dati = r.json().get("result", {}).get(address.lower(), {})
+        if not dati:
+            return 0, ["❌ Token non trovato su GoPlus"]
 
-            if risultato.get("is_honeypot") == "1":
-                return False, "🚨 HONEYPOT (GoPlus)"
+        score = 100
+        problemi = []
+        
+        # Check bloccanti - se uno di questi è positivo scarta subito
+        if dati.get("is_honeypot") == "1":
+            return 0, ["🚨 HONEYPOT"]
+        if dati.get("is_blacklisted") == "1":
+            return 0, ["🚨 BLACKLISTED"]
+        if dati.get("is_phishing_init") == "1":
+            return 0, ["🚨 PHISHING"]
+        if dati.get("cannot_sell_all") == "1":
+            return 0, ["🚨 NON VENDIBILE"]
+        if dati.get("transfer_pausable") == "1":
+            return 0, ["🚨 TRANSFER PAUSABLE"]
+        if dati.get("is_anti_whale") == "1" and dati.get("anti_whale_modifiable") == "1":
+            return 0, ["🚨 ANTI-WHALE MODIFICABILE"]
 
-            if risultato.get("is_blacklisted") == "1":
-                return False, "🚨 BLACKLISTED (GoPlus)"
+        # Tax
+        sell_tax = float(dati.get("sell_tax", 0) or 0)
+        buy_tax = float(dati.get("buy_tax", 0) or 0)
+        if sell_tax > 20:
+            return 0, [f"🚨 Sell tax {sell_tax}%"]
+        if sell_tax > 5:
+            score -= 20
+            problemi.append(f"⚠️ Sell tax {sell_tax}%")
+        if buy_tax > 5:
+            score -= 10
+            problemi.append(f"⚠️ Buy tax {buy_tax}%")
 
-            if risultato.get("is_phishing_init") == "1":
-                return False, "🚨 PHISHING (GoPlus)"
+        # Owner concentration
+        owner_pct = float(dati.get("owner_percent", 0) or 0)
+        creator_pct = float(dati.get("creator_percent", 0) or 0)
+        if owner_pct > 30 or creator_pct > 30:
+            return 0, [f"🚨 Owner/Creator ha {max(owner_pct, creator_pct):.0f}% supply"]
+        if owner_pct > 10:
+            score -= 15
+            problemi.append(f"⚠️ Owner ha {owner_pct:.0f}% supply")
 
-            buy_tax = float(risultato.get("buy_tax", 0) or 0)
-            sell_tax = float(risultato.get("sell_tax", 0) or 0)
+        # Mintable
+        if dati.get("is_mintable") == "1":
+            score -= 20
+            problemi.append("⚠️ Token mintable")
 
-            if sell_tax > 50:
-                return False, f"🚨 Sell tax {sell_tax}% (GoPlus)"
-            if sell_tax > 10:
-                problemi.append(f"⚠️ Sell tax {sell_tax}%")
-                score_penalty += 20
-            if buy_tax > 10:
-                problemi.append(f"⚠️ Buy tax {buy_tax}%")
-                score_penalty += 10
+        # Proxy
+        if dati.get("is_proxy") == "1":
+            score -= 10
+            problemi.append("⚠️ Contratto proxy")
 
-            if risultato.get("cannot_sell_all") == "1":
-                return False, "🚨 Non puoi vendere (GoPlus)"
+        # Holders
+        holder_count = int(dati.get("holder_count", 0) or 0)
+        if holder_count < 50:
+            score -= 15
+            problemi.append(f"⚠️ Pochi holder: {holder_count}")
+        elif holder_count > 200:
+            problemi.append(f"✅ Holder: {holder_count}")
 
-            if risultato.get("is_mintable") == "1":
-                problemi.append("⚠️ Token mintable")
-                score_penalty += 15
+        if not problemi:
+            problemi.append("✅ GoPlus: nessun problema")
 
-            owner_pct = float(risultato.get("owner_percent", 0) or 0)
-            if owner_pct > 50:
-                problemi.append(f"⚠️ Owner ha {owner_pct}% supply")
-                score_penalty += 20
+        return max(0, score), problemi
 
-            testo = "\n".join(problemi) if problemi else "✅ GoPlus OK"
-            return score_penalty < 40, testo
     except Exception as e:
-        print(f"GoPlus error: {e}")
-    return True, "⚠️ GoPlus non disponibile"
+        print(f"GoPlus ETH error: {e}")
+        return 50, ["⚠️ GoPlus non disponibile"]
 
-def analizza_sicurezza(address, chain):
-    """Analisi combinata: Blockaid + GoPlus + Honeypot"""
-    score = 100
-    tutti_problemi = []
+def check_goplus_sol(address):
+    """GoPlus check per Solana"""
+    try:
+        url = f"https://api.gopluslabs.io/api/v1/token_security/900?contract_addresses={address}"
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return 50, ["⚠️ GoPlus SOL non disponibile"]
+        
+        dati = r.json().get("result", {}).get(address.lower(), {})
+        if not dati:
+            return 50, ["⚠️ Token SOL non su GoPlus"]
 
-    # Check Blockaid
-    ok, msg = check_blockaid(address, chain)
-    if not ok:
-        return 0, [msg]
-    tutti_problemi.append(msg)
+        score = 100
+        problemi = []
 
-    # Check GoPlus
-    ok, msg = check_goplus(address, chain)
-    if not ok:
-        return 0, [msg]
-    tutti_problemi.append(msg)
+        if dati.get("is_honeypot") == "1":
+            return 0, ["🚨 HONEYPOT SOL"]
 
-    # Check Honeypot (solo ETH)
-    if chain == "ETH":
-        try:
-            r = requests.get(f"https://api.honeypot.is/v2/IsHoneypot?address={address}", timeout=10)
-            dati = r.json()
-            if dati.get("isHoneypot"):
-                return 0, ["🚨 HONEYPOT RILEVATO"]
-            sim = dati.get("simulationResult", {})
-            sell_tax = sim.get("sellTax", 0)
-            buy_tax = sim.get("buyTax", 0)
-            if sell_tax > 50:
-                return 0, [f"🚨 Sell tax critica: {sell_tax}%"]
-            if sell_tax > 10:
-                score -= 25
-                tutti_problemi.append(f"⚠️ Sell tax: {sell_tax}%")
-            if buy_tax > 10:
-                score -= 15
-                tutti_problemi.append(f"⚠️ Buy tax: {buy_tax}%")
-        except:
-            tutti_problemi.append("⚠️ Honeypot check non disponibile")
+        # Mintable authority
+        if dati.get("mintable") == "1":
+            score -= 25
+            problemi.append("⚠️ Mint authority attiva")
 
-    return max(0, score), tutti_problemi
+        # Freeze authority
+        if dati.get("freezeable") == "1":
+            score -= 30
+            problemi.append("⚠️ Freeze authority attiva")
+
+        # Top holder concentration
+        top10 = float(dati.get("top_10_holder_rate", 0) or 0) * 100
+        if top10 > 80:
+            return 0, [f"🚨 Top 10 holder hanno {top10:.0f}% supply"]
+        if top10 > 50:
+            score -= 20
+            problemi.append(f"⚠️ Top 10 holder: {top10:.0f}%")
+        else:
+            problemi.append(f"✅ Top 10 holder: {top10:.0f}%")
+
+        if not problemi:
+            problemi.append("✅ GoPlus SOL: ok")
+
+        return max(0, score), problemi
+
+    except Exception as e:
+        print(f"GoPlus SOL error: {e}")
+        return 50, ["⚠️ GoPlus SOL non disponibile"]
+
+def check_duplicati(nome, chain_id):
+    """Controlla se esistono molti token con lo stesso nome - segnale di scam"""
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/search?q={nome}"
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return False
+        pairs = r.json().get("pairs", [])
+        # Filtra per chain
+        stessa_chain = [p for p in pairs if p.get("chainId") == chain_id]
+        # Se ci sono più di 3 token con lo stesso nome è sospetto
+        if len(stessa_chain) > 3:
+            print(f"  ⚠️ Trovati {len(stessa_chain)} token con nome '{nome}' - possibile scam")
+            return True
+        return False
+    except:
+        return False
 
 token_visti = set()
 
@@ -160,9 +189,8 @@ def fetch_pair_info(token_address):
         r = requests.get(url, timeout=15)
         if r.status_code != 200:
             return None
-        dati = r.json()
-        pairs = dati.get("pairs")
-        if not pairs or len(pairs) == 0:
+        pairs = r.json().get("pairs")
+        if not pairs:
             return None
         return pairs[0]
     except:
@@ -189,24 +217,37 @@ def analizza_token(token, chain):
         created_at = pair.get("pairCreatedAt", 0)
         eta_ore = (time.time() * 1000 - created_at) / (1000 * 3600) if created_at else 999
 
-        if liquidita < MIN_LIQUIDITA_USD or volume < MIN_VOLUME_24H_USD or eta_ore > MAX_ETA_ORE:
+        # Filtri base
+        if liquidita < MIN_LIQUIDITA_USD:
+            return False
+        if volume < MIN_VOLUME_24H_USD:
+            return False
+        if eta_ore > MAX_ETA_ORE:
             return False
 
-        print(f"Analizzo {simbolo} ({chain})...")
-        score, problemi = analizza_sicurezza(address, chain)
-
-        if score < MIN_SICUREZZA_SCORE:
-            print(f"  Scartato - sicurezza: {score}/100")
+        # Check duplicati nome
+        chain_id = "ethereum" if chain == "ETH" else "solana"
+        if check_duplicati(nome, chain_id):
+            print(f"  ❌ {simbolo} scartato - nome duplicato (possibile scam)")
             return False
 
+        # Check sicurezza
+        print(f"  🔍 Analizzo {simbolo} ({chain})...")
         if chain == "ETH":
+            score, problemi = check_goplus_eth(address)
             link_dex = f"https://www.dextools.io/app/en/ether/pair-explorer/{pair_address}"
             link_scan = f"https://etherscan.io/token/{address}"
         else:
+            score, problemi = check_goplus_sol(address)
             link_dex = f"https://www.dextools.io/app/en/solana/pair-explorer/{pair_address}"
             link_scan = f"https://solscan.io/token/{address}"
 
-        emoji = "🟢" if score >= 85 else "🟡"
+        if score < MIN_SICUREZZA_SCORE:
+            print(f"  ❌ {simbolo} scartato - score {score}/100")
+            return False
+
+        # Token passato tutti i filtri!
+        emoji = "🟢" if score >= 90 else "🟡"
         chain_emoji = "🔷" if chain == "ETH" else "🟣"
         problemi_testo = "\n".join(problemi)
 
@@ -219,13 +260,13 @@ def analizza_token(token, chain):
 ⏱ Età: <b>{eta_ore:.1f} ore</b>
 🏦 DEX: <b>{dex}</b>
 
-{emoji} <b>Score Sicurezza: {score}/100</b>
+{emoji} <b>Score: {score}/100</b>
 {problemi_testo}
 
 📋 <code>{address}</code>
 🔗 <a href="{link_dex}">DexTools</a> | <a href="{link_scan}">Scan</a>
 
-⚠️ <i>Controlla sempre su Uniswap prima di comprare!</i>"""
+⚠️ <i>DYOR - Verifica sempre prima di comprare!</i>"""
 
         invia_telegram(messaggio)
         return True
@@ -235,8 +276,8 @@ def analizza_token(token, chain):
         return False
 
 def main():
-    print("CRYPTO SCANNER BOT AVVIATO - v2 con Blockaid+GoPlus")
-    invia_telegram("🤖 <b>Bot v2 avviato!</b>\n🛡 Controlli: Blockaid + GoPlus + Honeypot\nMonitoro Ethereum e Solana...")
+    print("CRYPTO SCANNER BOT v3 AVVIATO")
+    invia_telegram("🤖 <b>Bot v3 avviato!</b>\n🛡 GoPlus + Anti-duplicati\n⚙️ Filtri più severi attivi\nMonitoro ETH e SOL...")
     ciclo = 0
     while True:
         ciclo += 1
@@ -251,3 +292,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
